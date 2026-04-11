@@ -2,6 +2,7 @@ import SwiftUI
 import ARKit
 import CoreMotion
 import Network
+import Observation
 
 // ── Configuration ──────────────────────────────────────────────────────────────
 private let kDestinationHost: String = "255.255.255.255"  // change to receiver IP
@@ -10,7 +11,7 @@ private let kSendInterval: TimeInterval = 0.1             // 100 ms
 
 // ── Top-level view ──────────────────────────────────────────────────────────────
 struct ContentView: View {
-    @StateObject private var coordinator = ARCoordinator()
+    @State private var coordinator = ARCoordinator()
 
     var body: some View {
         ZStack(alignment: .bottom) {
@@ -51,10 +52,11 @@ struct ARViewContainer: UIViewRepresentable {
 }
 
 // ── Main coordinator ────────────────────────────────────────────────────────────
-final class ARCoordinator: NSObject, ObservableObject, ARSessionDelegate {
+@Observable
+final class ARCoordinator: NSObject, ARSessionDelegate {
 
-    @Published var packetCount: Int = 0
-    @Published var isRunning: Bool = false
+    var packetCount: Int = 0
+    var isRunning: Bool = false
 
     private var latestFrame: ARFrame?
     private let motion = CMMotionManager()
@@ -113,7 +115,7 @@ final class ARCoordinator: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
-        DispatchQueue.main.async { self.isRunning = false }
+        DispatchQueue.main.async { [weak self] in self?.isRunning = false }
     }
 
     // MARK: Packet
@@ -155,8 +157,8 @@ final class ARCoordinator: NSObject, ObservableObject, ARSessionDelegate {
 
         udp?.send(content: data, completion: .idempotent)
 
-        DispatchQueue.main.async {
-            self.packetCount += 1
+        DispatchQueue.main.async { [weak self] in
+            self?.packetCount += 1
         }
     }
 }
