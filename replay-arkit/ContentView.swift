@@ -120,6 +120,52 @@ final class ARCoordinator: NSObject, ARSessionDelegate {
         DispatchQueue.main.async { [weak self] in self?.isRunning = false }
     }
 
+    // MARK: Color sampling
+
+    /// Sample the real camera color for a world-space ARKit feature point.
+    /// The caller must have already called CVPixelBufferLockBaseAddress(.readOnly)
+    /// on `pixelBuffer` before invoking this, and unlock after the batch is done.
+    private func sampleRGBLocked(
+        worldPt: simd_float3,
+        pixelBuffer: CVPixelBuffer,
+        camera: ARCamera
+    ) -> (UInt8, UInt8, UInt8) {
+        let imageRes = camera.imageResolution
+        let projected = camera.projectPoint(
+            worldPt,
+            orientation: .landscapeRight,
+            viewportSize: imageRes
+        )
+        let px = Int(projected.x)
+        let py = Int(projected.y)
+
+        guard px >= 0, px < Int(imageRes.width),
+              py >= 0, py < Int(imageRes.height) else {
+            return (255, 255, 255)  // out of frame → white
+        }
+
+        // Y plane: full resolution, 1 byte per pixel
+        let yPlane = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)!
+            .assumingMemoryBound(to: UInt8.self)
+        let yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        let Y = Int(yPlane[py * yStride + px])
+
+        // CbCr plane: half resolution, 2 bytes per chroma pixel (Cb then Cr)
+        let cbcrPlane = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1)!
+            .assumingMemoryBound(to: UInt8.self)
+        let cbcrStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
+        let chromaOff = (py / 2) * cbcrStride + (px / 2) * 2
+        let Cb = Int(cbcrPlane[chromaOff])
+        let Cr = Int(cbcrPlane[chromaOff + 1])
+
+        // BT.601 YCbCr → RGB
+        let R = min(max(Int(Double(Y) + 1.402   * Double(Cr - 128)), 0), 255)
+        let G = min(max(Int(Double(Y) - 0.344136 * Double(Cb - 128)
+                                      - 0.714136 * Double(Cr - 128)), 0), 255)
+        let B = min(max(Int(Double(Y) + 1.772   * Double(Cb - 128)), 0), 255)
+        return (UInt8(R), UInt8(G), UInt8(B))
+    }
+
     // MARK: Packet
 
     private func sendPacket() {
@@ -134,10 +180,17 @@ final class ARCoordinator: NSObject, ARSessionDelegate {
             t.columns.3.x, t.columns.3.y, t.columns.3.z, t.columns.3.w,
         ]
 
-        // ── Point cloud ───────────────────────────────────────────────────────
-        var pointArray: [[Float]] = []
+        // ── Point cloud (with per-point RGB sampled from camera image) ────────
+        var pointArray: [[Any]] = []
         if let cloud = frame.rawFeaturePoints {
-            pointArray = cloud.points.map { p in [p.x, p.y, p.z] }
+            let pixelBuffer = frame.capturedImage
+            CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+            pointArray = cloud.points.map { p in
+                let (r, g, b) = sampleRGBLocked(
+                    worldPt: p, pixelBuffer: pixelBuffer, camera: frame.camera)
+                return [p.x, p.y, p.z, Int(r), Int(g), Int(b)]
+            }
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
         }
 
         // ── Device motion quaternion ──────────────────────────────────────────
@@ -151,7 +204,7 @@ final class ARCoordinator: NSObject, ARSessionDelegate {
         let payload: [String: Any] = [
             "ts":             frame.timestamp,
             "cameraMatrix":   matrix,           // col-major 4×4
-            "pointCloud":     pointArray,        // [[x,y,z], ...]
+            "pointCloud":     pointArray,        // [[x,y,z,r,g,b], ...]
             "quatXYZW":       quat,              // device motion quaternion
         ]
 
