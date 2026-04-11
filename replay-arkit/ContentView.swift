@@ -5,7 +5,7 @@ import Network
 import Observation
 
 // ── Configuration ──────────────────────────────────────────────────────────────
-private let kDestinationHost: String = "255.255.255.255"  // change to receiver IP
+private let kDestinationHost: String = "192.168.2.1"  // change to receiver IP
 private let kDestinationPort: UInt16 = 9000
 private let kSendInterval: TimeInterval = 0.1             // 100 ms
 
