@@ -1,15 +1,12 @@
 import SwiftUI
 import ARKit
 import CoreMotion
-import Network
 import Observation
 
-//
-
 // ── Configuration ──────────────────────────────────────────────────────────────
-private let kDestinationHost: String = "192.168.2.1"  // change to receiver IP
-private let kDestinationPort: UInt16 = 9000
-private let kSendInterval: TimeInterval = 0.1             // 100 ms
+private let kWSHosts: [String] = ["192.168.2.1", "172.23.27.18"]
+private let kWSPort: Int    = 8765
+private let kSendInterval: TimeInterval = 0.1 // 10 Hz
 
 // ── Top-level view ──────────────────────────────────────────────────────────────
 struct ContentView: View {
@@ -20,12 +17,11 @@ struct ContentView: View {
             ARViewContainer(coordinator: coordinator)
                 .ignoresSafeArea()
 
-            // Status badge
             HStack(spacing: 6) {
                 Circle()
-                    .fill(coordinator.isRunning ? Color.green : Color.red)
+                    .fill(coordinator.isConnected ? Color.green : Color.red)
                     .frame(width: 8, height: 8)
-                Text("UDP :\(kDestinationPort)  pkts: \(coordinator.packetCount)")
+                Text("WS \(coordinator.currentHost):\(kWSPort)  pkts: \(coordinator.packetCount)")
                     .font(.system(size: 13, weight: .medium, design: .monospaced))
                     .foregroundColor(.white)
             }
@@ -55,44 +51,106 @@ struct ARViewContainer: UIViewRepresentable {
 
 // ── Main coordinator ────────────────────────────────────────────────────────────
 @Observable
-final class ARCoordinator: NSObject, ARSessionDelegate {
+final class ARCoordinator: NSObject, ARSessionDelegate, URLSessionWebSocketDelegate {
 
     var packetCount: Int = 0
-    var isRunning: Bool = false
+    var isConnected: Bool = false
+    var currentHost: String = kWSHosts[0]
 
     private var latestFrame: ARFrame?
     private let motion = CMMotionManager()
-    private var udp: NWConnection?
     private var timer: Timer?
     private var debugCounter: Int = 0
+
+    private var urlSession: URLSession!
+    private var wsTask: URLSessionWebSocketTask?
+    private var inFlight: Int = 0   // main-thread only
+    private var hostIndex: Int = 0
 
     // MARK: Setup
 
     override init() {
         super.init()
-        setupUDP()
+        let cfg = URLSessionConfiguration.default
+        cfg.waitsForConnectivity = false       // fail fast so we get real errors + retry
+        // No request timeout — WebSocket is a persistent connection; idle gaps are normal.
+        urlSession = URLSession(configuration: cfg, delegate: self, delegateQueue: .main)
         setupMotion()
+        connectWS()
     }
 
     func bind(session: ARSession) {
         let config = ARWorldTrackingConfiguration()
-        // Enable raw feature points (point cloud)
-        config.frameSemantics = []
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+            config.frameSemantics.insert(.smoothedSceneDepth)
+        } else if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            config.frameSemantics.insert(.sceneDepth)
+        }
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
-        isRunning = true
         startTimer()
     }
 
-    // MARK: UDP
+    // MARK: WebSocket
 
-    private func setupUDP() {
-        let params = NWParameters.udp
-        params.allowLocalEndpointReuse = true
+    private func connectWS() {
+        wsTask?.cancel(with: .goingAway, reason: nil)
+        currentHost = kWSHosts[hostIndex % kWSHosts.count]
+        guard let url = URL(string: "ws://\(currentHost):\(kWSPort)") else { return }
+        print("[WS] connecting to \(url.absoluteString)")
+        let task = urlSession.webSocketTask(with: url)
+        wsTask = task
+        inFlight = 0
+        task.resume()
+        listenLoop(task)
+    }
 
-        let host = NWEndpoint.Host(kDestinationHost)
-        let port = NWEndpoint.Port(rawValue: kDestinationPort)!
-        udp = NWConnection(host: host, port: port, using: params)
-        udp?.start(queue: .global(qos: .utility))
+    private func listenLoop(_ task: URLSessionWebSocketTask) {
+        task.receive { [weak self, weak task] result in
+            guard let self = self, let task = task, self.wsTask === task else { return }
+            switch result {
+            case .success:
+                self.listenLoop(task)
+            case .failure(let err):
+                print("[WS] recv err: \(err.localizedDescription)")
+                self.scheduleReconnect()
+            }
+        }
+    }
+
+    private func scheduleReconnect() {
+        isConnected = false
+        wsTask?.cancel(with: .goingAway, reason: nil)
+        wsTask = nil
+        hostIndex = (hostIndex + 1) % kWSHosts.count
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.connectWS()
+        }
+    }
+
+    // URLSessionWebSocketDelegate
+    func urlSession(_ session: URLSession,
+                    webSocketTask: URLSessionWebSocketTask,
+                    didOpenWithProtocol protocolName: String?) {
+        print("[WS] connected")
+        isConnected = true
+    }
+
+    func urlSession(_ session: URLSession,
+                    webSocketTask: URLSessionWebSocketTask,
+                    didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
+                    reason: Data?) {
+        print("[WS] closed code=\(closeCode.rawValue)")
+        scheduleReconnect()
+    }
+
+    func urlSession(_ session: URLSession,
+                    task: URLSessionTask,
+                    didCompleteWithError error: Error?) {
+        guard task == wsTask else { return }
+        if let error {
+            print("[WS] task error: \(error.localizedDescription) | \(error)")
+            scheduleReconnect()
+        }
     }
 
     // MARK: Motion
@@ -117,33 +175,21 @@ final class ARCoordinator: NSObject, ARSessionDelegate {
         latestFrame = frame
     }
 
-    func session(_ session: ARSession, didFailWithError error: Error) {
-        DispatchQueue.main.async { [weak self] in self?.isRunning = false }
-    }
+    func session(_ session: ARSession, didFailWithError error: Error) {}
 
-    // MARK: Color sampling
+    // MARK: Color sampling (sparse fallback)
 
-    /// Sample the real camera color for a world-space ARKit feature point.
-    /// The caller must have already called CVPixelBufferLockBaseAddress(.readOnly)
-    /// on `pixelBuffer` before invoking this, and unlock after the batch is done.
-    /// Returns nil if the point is behind the camera or projects outside the
-    /// captured image — callers should drop those points entirely.
     private func sampleRGBLocked(
         worldPt: simd_float3,
         pixelBuffer: CVPixelBuffer,
         camera: ARCamera
     ) -> (UInt8, UInt8, UInt8)? {
-        // World → camera space (ARKit: camera looks down -Z, so points in
-        // front of the camera have camPt.z < 0).
         let worldToCam = simd_inverse(camera.transform)
         let pt4 = simd_float4(worldPt.x, worldPt.y, worldPt.z, 1)
         let camPt = worldToCam * pt4
-
-        guard camPt.z < 0 else { return nil }  // behind camera
+        guard camPt.z < 0 else { return nil }
         let depth = -camPt.z
 
-        // Pinhole projection using intrinsics (in native sensor pixels).
-        // ARKit camera Y points up while image Y points down → flip Y.
         let K  = camera.intrinsics
         let fx = K.columns.0.x
         let fy = K.columns.1.y
@@ -158,18 +204,13 @@ final class ARCoordinator: NSObject, ARSessionDelegate {
         let height = Int(imageRes.height)
         let px = Int(u)
         let py = Int(v)
+        guard px >= 0, px < width, py >= 0, py < height else { return nil }
 
-        guard px >= 0, px < width, py >= 0, py < height else {
-            return nil  // outside captured image
-        }
-
-        // Y plane: full resolution, 1 byte per pixel
         let yPlane = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0)!
             .assumingMemoryBound(to: UInt8.self)
         let yStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
         let Y = Int(yPlane[py * yStride + px])
 
-        // CbCr plane: half resolution, 2 bytes per chroma pixel (Cb then Cr)
         let cbcrPlane = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1)!
             .assumingMemoryBound(to: UInt8.self)
         let cbcrStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
@@ -177,7 +218,6 @@ final class ARCoordinator: NSObject, ARSessionDelegate {
         let Cb = Int(cbcrPlane[chromaOff])
         let Cr = Int(cbcrPlane[chromaOff + 1])
 
-        // BT.601 YCbCr → RGB
         let R = min(max(Int(Double(Y) + 1.402   * Double(Cr - 128)), 0), 255)
         let G = min(max(Int(Double(Y) - 0.344136 * Double(Cb - 128)
                                       - 0.714136 * Double(Cr - 128)), 0), 255)
@@ -185,72 +225,214 @@ final class ARCoordinator: NSObject, ARSessionDelegate {
         return (UInt8(R), UInt8(G), UInt8(B))
     }
 
+    // MARK: LiDAR dense cloud → binary blob
+    // Each point is 15 B: f32 x, f32 y, f32 z, u8 r, u8 g, u8 b (little-endian).
+
+    private func buildDenseCloudBinary(frame: ARFrame, depthData: ARDepthData) -> (UInt32, Data) {
+        let depthMap = depthData.depthMap
+        let colorBuf = frame.capturedImage
+        let confMap  = depthData.confidenceMap
+
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        CVPixelBufferLockBaseAddress(colorBuf, .readOnly)
+        if let cm = confMap { CVPixelBufferLockBaseAddress(cm, .readOnly) }
+        defer {
+            CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+            CVPixelBufferUnlockBaseAddress(colorBuf, .readOnly)
+            if let cm = confMap { CVPixelBufferUnlockBaseAddress(cm, .readOnly) }
+        }
+
+        let dw = CVPixelBufferGetWidth(depthMap)
+        let dh = CVPixelBufferGetHeight(depthMap)
+        let dStrideElems =
+            CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.stride
+        let dPtr = CVPixelBufferGetBaseAddress(depthMap)!
+            .assumingMemoryBound(to: Float32.self)
+
+        var confPtr: UnsafeMutablePointer<UInt8>? = nil
+        var confStride = 0
+        if let cm = confMap {
+            confPtr = CVPixelBufferGetBaseAddress(cm)!
+                .assumingMemoryBound(to: UInt8.self)
+            confStride = CVPixelBufferGetBytesPerRow(cm)
+        }
+
+        let colorW     = CVPixelBufferGetWidthOfPlane(colorBuf, 0)
+        let colorH     = CVPixelBufferGetHeightOfPlane(colorBuf, 0)
+        let yStride    = CVPixelBufferGetBytesPerRowOfPlane(colorBuf, 0)
+        let cbcrStride = CVPixelBufferGetBytesPerRowOfPlane(colorBuf, 1)
+        let yPlane = CVPixelBufferGetBaseAddressOfPlane(colorBuf, 0)!
+            .assumingMemoryBound(to: UInt8.self)
+        let cbcrPlane = CVPixelBufferGetBaseAddressOfPlane(colorBuf, 1)!
+            .assumingMemoryBound(to: UInt8.self)
+
+        let imgRes = frame.camera.imageResolution
+        let K  = frame.camera.intrinsics
+        let sx = Float(dw) / Float(imgRes.width)
+        let sy = Float(dh) / Float(imgRes.height)
+        let fxd = K.columns.0.x * sx
+        let fyd = K.columns.1.y * sy
+        let cxd = K.columns.2.x * sx
+        let cyd = K.columns.2.y * sy
+
+        let colorScaleX = Float(colorW) / Float(dw)
+        let colorScaleY = Float(colorH) / Float(dh)
+
+        let camT = frame.camera.transform
+
+        // Stride 4 on the 256×192 depth map → ~3000 candidates, ~1500–2000 kept
+        // after confidence/range filtering. At 15 B/pt that's ~25–30 KB per
+        // binary WS frame — comfortable over local TCP.
+        let strideX = 4
+        let strideY = 4
+
+        var data = Data()
+        data.reserveCapacity((dw / strideX) * (dh / strideY) * 15)
+        var count: UInt32 = 0
+
+        var v = 0
+        while v < dh {
+            var u = 0
+            while u < dw {
+                defer { u += strideX }
+
+                if let cp = confPtr {
+                    let conf = cp[v * confStride + u]
+                    if conf == 0 { continue }
+                }
+
+                let d = dPtr[v * dStrideElems + u]
+                if !d.isFinite || d <= 0.05 || d > 5.0 { continue }
+
+                let xCam =  (Float(u) - cxd) * d / fxd
+                let yCam = -(Float(v) - cyd) * d / fyd
+                let zCam = -d
+
+                let wp = camT * simd_float4(xCam, yCam, zCam, 1)
+
+                let cx = Int(Float(u) * colorScaleX)
+                let cy = Int(Float(v) * colorScaleY)
+                if cx < 0 || cx >= colorW || cy < 0 || cy >= colorH { continue }
+
+                let Y  = Int(yPlane[cy * yStride + cx])
+                let off = (cy / 2) * cbcrStride + (cx / 2) * 2
+                let Cb = Int(cbcrPlane[off])
+                let Cr = Int(cbcrPlane[off + 1])
+
+                let R = UInt8(min(max(Int(Double(Y) + 1.402    * Double(Cr - 128)), 0), 255))
+                let G = UInt8(min(max(Int(Double(Y) - 0.344136 * Double(Cb - 128)
+                                                    - 0.714136 * Double(Cr - 128)), 0), 255))
+                let B = UInt8(min(max(Int(Double(Y) + 1.772    * Double(Cb - 128)), 0), 255))
+
+                var fx32 = wp.x
+                var fy32 = wp.y
+                var fz32 = wp.z
+                withUnsafeBytes(of: &fx32) { data.append(contentsOf: $0) }
+                withUnsafeBytes(of: &fy32) { data.append(contentsOf: $0) }
+                withUnsafeBytes(of: &fz32) { data.append(contentsOf: $0) }
+                data.append(R)
+                data.append(G)
+                data.append(B)
+                count += 1
+            }
+            v += strideY
+        }
+
+        return (count, data)
+    }
+
     // MARK: Packet
+    //
+    // Binary layout (little-endian):
+    //   u32  magic  = 0x41524b54 ("ARKT")
+    //   f64  timestamp
+    //   f32  cameraMatrix[16]  (col-major)
+    //   f32  quatXYZW[4]
+    //   u32  pointCount
+    //   repeated pointCount × { f32 x, f32 y, f32 z, u8 r, u8 g, u8 b }
 
     private func sendPacket() {
         guard let frame = latestFrame else { return }
+        guard isConnected, let task = wsTask else { return }
+        guard inFlight < 3 else { return }   // drop frame if WS is backlogged
 
-        // ── Camera world transform (column-major, 16 floats) ──────────────────
+        var pointBlob = Data()
+        var numPoints: UInt32 = 0
+        var mode = "none"
+
+        if let depth = frame.smoothedSceneDepth ?? frame.sceneDepth {
+            let (n, blob) = buildDenseCloudBinary(frame: frame, depthData: depth)
+            numPoints = n
+            pointBlob = blob
+            mode = "lidar"
+        } else if let cloud = frame.rawFeaturePoints {
+            let pixelBuffer = frame.capturedImage
+            CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+            pointBlob.reserveCapacity(cloud.points.count * 15)
+            for p in cloud.points {
+                guard let (r, g, b) = sampleRGBLocked(
+                    worldPt: p, pixelBuffer: pixelBuffer, camera: frame.camera
+                ) else { continue }
+                var x: Float32 = p.x
+                var y: Float32 = p.y
+                var z: Float32 = p.z
+                withUnsafeBytes(of: &x) { pointBlob.append(contentsOf: $0) }
+                withUnsafeBytes(of: &y) { pointBlob.append(contentsOf: $0) }
+                withUnsafeBytes(of: &z) { pointBlob.append(contentsOf: $0) }
+                pointBlob.append(r)
+                pointBlob.append(g)
+                pointBlob.append(b)
+                numPoints += 1
+            }
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+            mode = "sparse"
+        }
+
+        var header = Data()
+        header.reserveCapacity(96)
+
+        var magic: UInt32 = 0x41524b54
+        withUnsafeBytes(of: &magic) { header.append(contentsOf: $0) }
+
+        var ts: Float64 = frame.timestamp
+        withUnsafeBytes(of: &ts) { header.append(contentsOf: $0) }
+
         let t = frame.camera.transform
-        let matrix: [Float] = [
+        let matrixFloats: [Float32] = [
             t.columns.0.x, t.columns.0.y, t.columns.0.z, t.columns.0.w,
             t.columns.1.x, t.columns.1.y, t.columns.1.z, t.columns.1.w,
             t.columns.2.x, t.columns.2.y, t.columns.2.z, t.columns.2.w,
             t.columns.3.x, t.columns.3.y, t.columns.3.z, t.columns.3.w,
         ]
+        matrixFloats.withUnsafeBytes { header.append(contentsOf: $0) }
 
-        // ── Point cloud (with per-point RGB sampled from camera image) ────────
-        // Drops any point that is behind the camera or projects outside the
-        // captured image — persistent ARKit feature points that aren't in the
-        // current view.
-        var pointArray: [[Any]] = []
-        var rawPointCount = 0
-        if let cloud = frame.rawFeaturePoints {
-            rawPointCount = cloud.points.count
-            let pixelBuffer = frame.capturedImage
-            CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-            pointArray = cloud.points.compactMap { p -> [Any]? in
-                guard let (r, g, b) = sampleRGBLocked(
-                    worldPt: p, pixelBuffer: pixelBuffer, camera: frame.camera)
-                else { return nil }
-                return [p.x, p.y, p.z, Int(r), Int(g), Int(b)]
-            }
-            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+        var quat: [Float32] = [0, 0, 0, 1]
+        if let dm = motion.deviceMotion {
+            let q = dm.attitude.quaternion
+            quat = [Float32(q.x), Float32(q.y), Float32(q.z), Float32(q.w)]
         }
+        quat.withUnsafeBytes { header.append(contentsOf: $0) }
+
+        var count = numPoints
+        withUnsafeBytes(of: &count) { header.append(contentsOf: $0) }
+
+        var full = header
+        full.append(pointBlob)
+
+        inFlight += 1
+        task.send(.data(full)) { [weak self] err in
+            self?.inFlight -= 1
+            if let err = err {
+                print("[WS] send err: \(err.localizedDescription)")
+                self?.scheduleReconnect()
+            }
+        }
+
+        packetCount += 1
 
         debugCounter += 1
         if debugCounter % 20 == 0 {
-            var rSum = 0, gSum = 0, bSum = 0
-            for pt in pointArray {
-                rSum += (pt[3] as? Int) ?? 0
-                gSum += (pt[4] as? Int) ?? 0
-                bSum += (pt[5] as? Int) ?? 0
-            }
-            let n = max(pointArray.count, 1)
-            print("[DBG] raw=\(rawPointCount) kept=\(pointArray.count) avgRGB=(\(rSum/n),\(gSum/n),\(bSum/n))")
-        }
-
-        // ── Device motion quaternion ──────────────────────────────────────────
-        var quat: [Double] = [0.0, 0.0, 0.0, 1.0]
-        if let dm = motion.deviceMotion {
-            let q = dm.attitude.quaternion
-            quat = [q.x, q.y, q.z, q.w]
-        }
-
-        // ── Assemble & send ───────────────────────────────────────────────────
-        let payload: [String: Any] = [
-            "ts":             frame.timestamp,
-            "cameraMatrix":   matrix,           // col-major 4×4
-            "pointCloud":     pointArray,        // [[x,y,z,r,g,b], ...]
-            "quatXYZW":       quat,              // device motion quaternion
-        ]
-
-        guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
-
-        udp?.send(content: data, completion: .idempotent)
-
-        DispatchQueue.main.async { [weak self] in
-            self?.packetCount += 1
+            print("[DBG] mode=\(mode) pts=\(numPoints) bytes=\(full.count)")
         }
     }
 }
