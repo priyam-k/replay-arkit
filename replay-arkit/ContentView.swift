@@ -4,6 +4,8 @@ import CoreMotion
 import Network
 import Observation
 
+//
+
 // ── Configuration ──────────────────────────────────────────────────────────────
 private let kDestinationHost: String = "192.168.2.1"  // change to receiver IP
 private let kDestinationPort: UInt16 = 9000
