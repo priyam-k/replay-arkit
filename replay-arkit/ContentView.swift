@@ -64,6 +64,7 @@ final class ARCoordinator: NSObject, ARSessionDelegate {
     private let motion = CMMotionManager()
     private var udp: NWConnection?
     private var timer: Timer?
+    private var debugCounter: Int = 0
 
     // MARK: Setup
 
@@ -125,23 +126,41 @@ final class ARCoordinator: NSObject, ARSessionDelegate {
     /// Sample the real camera color for a world-space ARKit feature point.
     /// The caller must have already called CVPixelBufferLockBaseAddress(.readOnly)
     /// on `pixelBuffer` before invoking this, and unlock after the batch is done.
+    /// Returns nil if the point is behind the camera or projects outside the
+    /// captured image — callers should drop those points entirely.
     private func sampleRGBLocked(
         worldPt: simd_float3,
         pixelBuffer: CVPixelBuffer,
         camera: ARCamera
-    ) -> (UInt8, UInt8, UInt8) {
-        let imageRes = camera.imageResolution
-        let projected = camera.projectPoint(
-            worldPt,
-            orientation: .landscapeRight,
-            viewportSize: imageRes
-        )
-        let px = Int(projected.x)
-        let py = Int(projected.y)
+    ) -> (UInt8, UInt8, UInt8)? {
+        // World → camera space (ARKit: camera looks down -Z, so points in
+        // front of the camera have camPt.z < 0).
+        let worldToCam = simd_inverse(camera.transform)
+        let pt4 = simd_float4(worldPt.x, worldPt.y, worldPt.z, 1)
+        let camPt = worldToCam * pt4
 
-        guard px >= 0, px < Int(imageRes.width),
-              py >= 0, py < Int(imageRes.height) else {
-            return (255, 255, 255)  // out of frame → white
+        guard camPt.z < 0 else { return nil }  // behind camera
+        let depth = -camPt.z
+
+        // Pinhole projection using intrinsics (in native sensor pixels).
+        // ARKit camera Y points up while image Y points down → flip Y.
+        let K  = camera.intrinsics
+        let fx = K.columns.0.x
+        let fy = K.columns.1.y
+        let cx = K.columns.2.x
+        let cy = K.columns.2.y
+
+        let u =  fx * camPt.x / depth + cx
+        let v = -fy * camPt.y / depth + cy
+
+        let imageRes = camera.imageResolution
+        let width  = Int(imageRes.width)
+        let height = Int(imageRes.height)
+        let px = Int(u)
+        let py = Int(v)
+
+        guard px >= 0, px < width, py >= 0, py < height else {
+            return nil  // outside captured image
         }
 
         // Y plane: full resolution, 1 byte per pixel
@@ -181,16 +200,34 @@ final class ARCoordinator: NSObject, ARSessionDelegate {
         ]
 
         // ── Point cloud (with per-point RGB sampled from camera image) ────────
+        // Drops any point that is behind the camera or projects outside the
+        // captured image — persistent ARKit feature points that aren't in the
+        // current view.
         var pointArray: [[Any]] = []
+        var rawPointCount = 0
         if let cloud = frame.rawFeaturePoints {
+            rawPointCount = cloud.points.count
             let pixelBuffer = frame.capturedImage
             CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
-            pointArray = cloud.points.map { p in
-                let (r, g, b) = sampleRGBLocked(
+            pointArray = cloud.points.compactMap { p -> [Any]? in
+                guard let (r, g, b) = sampleRGBLocked(
                     worldPt: p, pixelBuffer: pixelBuffer, camera: frame.camera)
+                else { return nil }
                 return [p.x, p.y, p.z, Int(r), Int(g), Int(b)]
             }
             CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+        }
+
+        debugCounter += 1
+        if debugCounter % 20 == 0 {
+            var rSum = 0, gSum = 0, bSum = 0
+            for pt in pointArray {
+                rSum += (pt[3] as? Int) ?? 0
+                gSum += (pt[4] as? Int) ?? 0
+                bSum += (pt[5] as? Int) ?? 0
+            }
+            let n = max(pointArray.count, 1)
+            print("[DBG] raw=\(rawPointCount) kept=\(pointArray.count) avgRGB=(\(rSum/n),\(gSum/n),\(bSum/n))")
         }
 
         // ── Device motion quaternion ──────────────────────────────────────────
