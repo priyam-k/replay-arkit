@@ -4,19 +4,25 @@ import CoreMotion
 import Observation
 
 // ── Configuration ──────────────────────────────────────────────────────────────
-private let kWSHosts: [String] = ["192.168.2.1", "172.23.27.18"]
+private let kWSHosts: [String] = [
+    "192.168.2.1",              // Mac-as-hotspot / USB tether
+    "172.20.10.2",              // Mac on iPhone hotspot
+    "Priyams-MacBook-Air.local" // same-router mDNS
+]
 private let kWSPort: Int    = 8765
 private let kSendInterval: TimeInterval = 0.1 // 10 Hz
 
 // ── Top-level view ──────────────────────────────────────────────────────────────
 struct ContentView: View {
     @State private var coordinator = ARCoordinator()
+    @State private var showHostPicker = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
             ARViewContainer(coordinator: coordinator)
                 .ignoresSafeArea()
 
+            // Status bar — tap to change host
             HStack(spacing: 6) {
                 Circle()
                     .fill(coordinator.isConnected ? Color.green : Color.red)
@@ -24,12 +30,22 @@ struct ContentView: View {
                 Text("WS \(coordinator.currentHost):\(kWSPort)  pkts: \(coordinator.packetCount)")
                     .font(.system(size: 13, weight: .medium, design: .monospaced))
                     .foregroundColor(.white)
+                Image(systemName: "chevron.up")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.white.opacity(0.7))
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
             .background(.black.opacity(0.55))
             .clipShape(Capsule())
             .padding(.bottom, 32)
+            .onTapGesture { showHostPicker = true }
+            .confirmationDialog("Select Mac host", isPresented: $showHostPicker) {
+                ForEach(kWSHosts, id: \.self) { host in
+                    Button(host) { coordinator.switchHost(host) }
+                }
+                Button("Cancel", role: .cancel) {}
+            }
         }
     }
 }
@@ -64,8 +80,8 @@ final class ARCoordinator: NSObject, ARSessionDelegate, URLSessionWebSocketDeleg
 
     private var urlSession: URLSession!
     private var wsTask: URLSessionWebSocketTask?
-    private var inFlight: Int = 0   // main-thread only
-    private var hostIndex: Int = 0
+    private var inFlight: Int = 0        // main-thread only
+    private var reconnectPending = false  // ensures only one reconnect is scheduled at a time
 
     // MARK: Setup
 
@@ -75,8 +91,16 @@ final class ARCoordinator: NSObject, ARSessionDelegate, URLSessionWebSocketDeleg
         cfg.waitsForConnectivity = false       // fail fast so we get real errors + retry
         // No request timeout — WebSocket is a persistent connection; idle gaps are normal.
         urlSession = URLSession(configuration: cfg, delegate: self, delegateQueue: .main)
+        print("[WS] coordinator init — session \(ObjectIdentifier(urlSession!))")
         setupMotion()
         connectWS()
+    }
+
+    deinit {
+        // invalidateAndCancel releases the delegate reference, breaking the retain cycle
+        // and killing any in-flight tasks so they don't keep calling back after dealloc.
+        urlSession.invalidateAndCancel()
+        timer?.invalidate()
     }
 
     func bind(session: ARSession) {
@@ -92,9 +116,15 @@ final class ARCoordinator: NSObject, ARSessionDelegate, URLSessionWebSocketDeleg
 
     // MARK: WebSocket
 
+    /// Switch to a different host and reconnect immediately. Called from the host picker UI.
+    func switchHost(_ host: String) {
+        currentHost = host
+        scheduleReconnect(delay: 0)
+    }
+
     private func connectWS() {
+        reconnectPending = false
         wsTask?.cancel(with: .goingAway, reason: nil)
-        currentHost = kWSHosts[hostIndex % kWSHosts.count]
         guard let url = URL(string: "ws://\(currentHost):\(kWSPort)") else { return }
         print("[WS] connecting to \(url.absoluteString)")
         let task = urlSession.webSocketTask(with: url)
@@ -111,18 +141,27 @@ final class ARCoordinator: NSObject, ARSessionDelegate, URLSessionWebSocketDeleg
             case .success:
                 self.listenLoop(task)
             case .failure(let err):
-                print("[WS] recv err: \(err.localizedDescription)")
-                self.scheduleReconnect()
+                let delay = Self.backoffDelay(for: err)
+                print("[WS] recv err (retry in \(Int(delay))s): \(err.localizedDescription)")
+                self.scheduleReconnect(delay: delay)
             }
         }
     }
 
-    private func scheduleReconnect() {
+    /// ENOMEM (error 12) means the socket pool is exhausted — back off 15 s.
+    private static func backoffDelay(for error: Error) -> TimeInterval {
+        return ((error as NSError).code == 12) ? 15.0 : 2.0
+    }
+
+    /// Tear down the current task and reconnect to `currentHost` after `delay` seconds.
+    /// The guard ensures only one reconnect is ever pending at a time.
+    private func scheduleReconnect(delay: TimeInterval = 2.0) {
+        guard !reconnectPending else { return }
+        reconnectPending = true
         isConnected = false
         wsTask?.cancel(with: .goingAway, reason: nil)
         wsTask = nil
-        hostIndex = (hostIndex + 1) % kWSHosts.count
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
             self?.connectWS()
         }
     }
@@ -131,7 +170,7 @@ final class ARCoordinator: NSObject, ARSessionDelegate, URLSessionWebSocketDeleg
     func urlSession(_ session: URLSession,
                     webSocketTask: URLSessionWebSocketTask,
                     didOpenWithProtocol protocolName: String?) {
-        print("[WS] connected")
+        print("[WS] connected to \(currentHost)")
         isConnected = true
     }
 
@@ -139,7 +178,7 @@ final class ARCoordinator: NSObject, ARSessionDelegate, URLSessionWebSocketDeleg
                     webSocketTask: URLSessionWebSocketTask,
                     didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
                     reason: Data?) {
-        print("[WS] closed code=\(closeCode.rawValue)")
+        print("[WS] closed \(closeCode.rawValue)")
         scheduleReconnect()
     }
 
@@ -148,8 +187,9 @@ final class ARCoordinator: NSObject, ARSessionDelegate, URLSessionWebSocketDeleg
                     didCompleteWithError error: Error?) {
         guard task == wsTask else { return }
         if let error {
-            print("[WS] task error: \(error.localizedDescription) | \(error)")
-            scheduleReconnect()
+            let delay = Self.backoffDelay(for: error)
+            print("[WS] task error (retry in \(Int(delay))s): \(error.localizedDescription)")
+            scheduleReconnect(delay: delay)
         }
     }
 
