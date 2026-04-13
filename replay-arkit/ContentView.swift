@@ -5,9 +5,10 @@ import Observation
 
 // ── Configuration ──────────────────────────────────────────────────────────────
 private let kWSHosts: [String] = [
+    "192.168.4.10",             // Mac on Replay ESP32 AP network (primary demo setup)
     "192.168.2.1",              // Mac-as-hotspot / USB tether
-    "172.20.10.2",              // Mac on iPhone hotspot
-    "Priyams-MacBook-Air.local" // same-router mDNS
+    "172.20.10.2",              // Mac on third-phone hotspot
+    "Priyams-MacBook-Air.local" // same-router mDNS (only works when Mac has internet)
 ]
 private let kWSPort: Int    = 8765
 private let kSendInterval: TimeInterval = 0.1 // 10 Hz
